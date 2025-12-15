@@ -1,0 +1,321 @@
+--- V6.8.cpp
++++ V6.8.cpp
+@@ -496,6 +496,7 @@
+ 
+     // Respawn waves for enemies
+     int respawnWavesRemaining = 0;
++    float ambientSkirmishCooldownS = 0.0f; // time until next ambient skirmish is allowed
++    float ambientSkirmishTimerS = 0.0f;    // internal timer for periodic checks
+ 
+     // Stats
+     int shotsFired = 0;
+@@ -2494,6 +2495,150 @@
+ bool Game::areEnemies(Faction a, Faction b) const {
+     if (sameSide(a, b)) return false;
+     return true;
+ }
+ 
++// -----------------------------------------------------------
++// Bark helpers (faction flavour + direction callouts)
++// -----------------------------------------------------------
++
++static const char* factionName(Faction f) {
++    switch (f) {
++    case Faction::Axis:    return "Axis";
++    case Faction::Allies:  return "Allies";
++    case Faction::Rebels:  return "Rebels";
++    case Faction::Militia: return "Militia";
++    default:               return "Unknown";
++    }
++}
++
++static std::string compass8(const Vec2& from, const Vec2& to) {
++    Vec2 d = to - from;
++    if (lenSq(d) < 1.0f) return "here";
++    float a = std::atan2(d.y, d.x); // -pi..pi
++    // 0 = E, pi/2 = S (because y grows down), so rotate to compass style
++    // We'll map to: E, SE, S, SW, W, NW, N, NE
++    const char* dirs[8] = { "east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east" };
++    float t = (a + 3.14159265f) / (2.0f * 3.14159265f); // 0..1
++    int idx = (int)std::floor(t * 8.0f + 0.5f) & 7;
++    return dirs[idx];
++}
++
++// Faction-specific "what do we call them?" strings
++static const char* factionLabelFor(Faction speaker, Faction target) {
++    if (speaker == Faction::Rebels) {
++        switch (target) {
++        case Faction::Axis:    return "fascists";
++        case Faction::Militia: return "rats";
++        case Faction::Allies:  return "rookies";
++        default:               return "them";
++        }
++    }
++    if (speaker == Faction::Militia) {
++        switch (target) {
++        case Faction::Axis:    return "comrades";
++        case Faction::Allies:  return "dogs";
++        case Faction::Rebels:  return "scum";
++        default:               return "them";
++        }
++    }
++    if (speaker == Faction::Axis) {
++        switch (target) {
++        case Faction::Militia: return "boys";
++        case Faction::Rebels:  return "scum";
++        case Faction::Allies:  return "foreign dogs";
++        default:               return "them";
++        }
++    }
++    // Allies
++    switch (target) {
++    case Faction::Axis:    return "fascists";
++    case Faction::Militia: return "trash";
++    case Faction::Rebels:  return "resistance";
++    default:               return "them";
++    }
++}
++
++static std::string barkSpottedEnemy(Faction speaker, Faction target, const std::string& dirWord) {
++    // Keep these short; they stack on-screen.
++    const char* label = factionLabelFor(speaker, target);
++    if (speaker == Faction::Axis) {
++        if (target == Faction::Militia) return "Militia " + std::string(label) + "! Look alive!";
++        if (target == Faction::Allies)  return std::string(label) + " to the " + dirWord + "!";
++        return std::string(label) + " to the " + dirWord + "!";
++    }
++    if (speaker == Faction::Allies) {
++        return std::string(label) + " to the " + dirWord + "!";
++    }
++    if (speaker == Faction::Rebels) {
++        return std::string(label) + " to the " + dirWord + "!";
++    }
++    // Militia
++    if (target == Faction::Axis) return std::string(label) + "! " + dirWord + "!";
++    return std::string(label) + " to the " + dirWord + "!";
++}
++
++// Plan barks: same intent, but different "voice" per faction.
++static const char* planBark(Faction side, SquadIntent intent) {
++    switch (side) {
++    case Faction::Axis:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold. Watch your sector.";
++        case SquadIntent::Advance: return "Advance. Keep pressure.";
++        case SquadIntent::Flank:   return "Flank them. Schnell!";
++        case SquadIntent::Retreat: return "Fall back. Re-form!";
++        case SquadIntent::Search:  return "Sweep. Find them.";
++        }
++        break;
++    case Faction::Allies:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold. Cover that lane.";
++        case SquadIntent::Advance: return "Move up. Stay sharp.";
++        case SquadIntent::Flank:   return "Flank left. Go!";
++        case SquadIntent::Retreat: return "Back! Find cover!";
++        case SquadIntent::Search:  return "Sweep it. Eyes open.";
++        }
++        break;
++    case Faction::Rebels:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold here. Stay low.";
++        case SquadIntent::Advance: return "Push! Push!";
++        case SquadIntent::Flank:   return "Around the side! Move!";
++        case SquadIntent::Retreat: return "Back! Back!";
++        case SquadIntent::Search:  return "They're close. Check corners!";
++        }
++        break;
++    case Faction::Militia:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Stay put. Don't die.";
++        case SquadIntent::Advance: return "Go on... go on!";
++        case SquadIntent::Flank:   return "Try the side...!";
++        case SquadIntent::Retreat: return "Run! Find cover!";
++        case SquadIntent::Search:  return "Look around... carefully.";
++        }
++        break;
++    }
++    return "Move!";
++}
++
+@@ -2709,14 +2854,16 @@
+         actors.push_back(a);
+         s.members.push_back((int)actors.size() - 1);
+-
+-        s.initialCount = (int)s.members.size();
+-        s.suppression = 0.0f;
+-        s.confidence = 1.0f;
+-
+     }
+ 
++    // Squad bookkeeping
++    s.initialCount = (int)s.members.size();
++    s.suppression = 0.0f;
++    s.confidence = 1.0f;
++
++
+     // --- NEW: build a few checkpoints around this squad's anchor ---
+ 
+     Vec2 anchor = (s.role == MissionRole::None) ? s.home : s.roleAnchor;
+@@ -3039,26 +3186,7 @@
+         if (s.leader >= 0 && s.leader < (int)actors.size() && actors[s.leader].alive()) {
+             barkPos = actors[s.leader].pos;
+         }
+-
+-        switch (s.intent) {
+-        case SquadIntent::Hold:
+-            pushBark(barkPos, "Hold position. Watch that sector.", 2.0f);
+-            break;
+-        case SquadIntent::Advance:
+-            pushBark(barkPos, "Advance on that position.", 2.0f);
+-            break;
+-        case SquadIntent::Flank:
+-            pushBark(barkPos, "Flank them. Move!", 2.0f);
+-            break;
+-        case SquadIntent::Retreat:
+-            pushBark(barkPos, "Fall back! Find cover!", 2.0f);
+-            break;
+-        case SquadIntent::Search:
+-            pushBark(barkPos, "They were just here. Sweep that area.", 2.0f);
+-            break;
+-        }
++        pushBark(barkPos, planBark(s.side, s.intent), 2.0f);
+     }
+ 
+@@ -3291,6 +3419,18 @@
+     bool seesThreat  = false;
+     bool hasThreat   = acquireThreat(a, threatPos, threatIdx, seesThreat);
+ 
++    // 1b) Flavour bark when visually spotting an enemy (faction-to-faction callouts)
++    if (hasThreat && seesThreat && barksEnabled && a.barkCooldown <= 0.f) {
++        Faction tgt = (threatIdx == -1) ? player.team : actors[threatIdx].team;
++        // Keep it occasional, not every frame
++        if (frand(0.f, 1.f) < 0.20f) {
++            std::string dirWord = compass8(a.pos, threatPos);
++            std::string line = barkSpottedEnemy(a.team, tgt, dirWord);
++            pushBark(a.pos, line.c_str(), 1.9f);
++            a.barkCooldown = 2.6f;
++        }
++    }
++
+     // 2) Ally suspicion of player (secret operative)
+     bool observingUnknownFriend = false;
+@@ -3367,6 +3507,62 @@
+                 if (observingUnknownFriend)
+                     return;
+             }
+         }
+     }
+ 
++    // 2b) Rebel intel: friendly rebels will occasionally give the player a direction callout
++    //     when the player is in their FOV and they're not currently engaged.
++    if (a.team == Faction::Rebels &&
++        playerPresent && player.alive() &&
++        sameSide(a.team, player.team) &&
++        !hasThreat)
++    {
++        bool los = false;
++        if (sees(a, player.pos, los) && los) {
++            // If rebels know about enemies nearby, point them out.
++            Vec2 bestEnemyPos{};
++            bool haveEnemy = false;
++            float bestD2 = 1e30f;
++
++            // Use squad memory first
++            if (a.squadId >= 0 && a.squadId < (int)squads.size()) {
++                const Squad& sq = squads[a.squadId];
++                if (sq.hasLastKnownEnemy) {
++                    bestEnemyPos = sq.lastKnownEnemy;
++                    haveEnemy = true;
++                }
++            }
++
++            // Else find nearest *enemy* to the player (cheap scan)
++            if (!haveEnemy) {
++                for (const auto& o : actors) {
++                    if (!o.alive()) continue;
++                    if (!areEnemies(player.team, o.team)) continue;
++                    float d2 = lenSq(o.pos - player.pos);
++                    if (d2 < bestD2) { bestD2 = d2; bestEnemyPos = o.pos; haveEnemy = true; }
++                }
++            }
++
++            if (barksEnabled && a.barkCooldown <= 0.f) {
++                if (haveEnemy) {
++                    std::string dirWord = compass8(player.pos, bestEnemyPos);
++                    std::string line = std::string("Psst. ") + factionLabelFor(Faction::Rebels, Faction::Axis) + " " +
++                        "activity to the " + dirWord + ".";
++                    pushBark(a.pos, line.c_str(), 2.3f);
++                    a.barkCooldown = 6.0f;
++                } else if (frand(0.f, 1.f) < 0.06f) {
++                    pushBark(a.pos, "Stay low, rookie. Roads aren't safe.", 2.3f);
++                    a.barkCooldown = 6.0f;
++                }
++            }
++        }
++    }
++
+     // 3) From here on, use hasThreat / states as usual...
+     //     recentlyHit cover, AIState selection, etc.
+     //     (your existing code continues here)
+@@ -4308,6 +4504,74 @@
+         }
+     }
+ 
++    // -------------------------------------------------------
++    // Ambient skirmishes: spawn small enemy-vs-enemy fights in clear areas
++    // -------------------------------------------------------
++    mission.ambientSkirmishCooldownS = std::max(0.0f, mission.ambientSkirmishCooldownS - dt);
++    mission.ambientSkirmishTimerS += dt;
++
++    // Try a skirmish every ~10 seconds when not already too hot
++    if (mission.ambientSkirmishCooldownS <= 0.0f && mission.ambientSkirmishTimerS > 10.0f) {
++        mission.ambientSkirmishTimerS = 0.0f;
++
++        // Lower chance as alarm gets high (mission already busy), and don't do it if we're nearly done.
++        float p = 0.22f - 0.03f * (float)mission.alarmLevel;
++        if (mission.phase == MissionPhase::Exfil) p *= 0.6f;
++
++        if (frand(0.0f, 1.0f) < std::max(0.0f, p)) {
++            std::vector<Vec2> avoid{ player.pos };
++            // Keep it away from the player so it's "ambient" rather than immediate spawn-in combat
++            Vec2 center = randomClearPos(8, avoid, 22.0f);
++
++            // Pick two hostile factions (avoid Allies so it doesn't feel like spawning friendly AI behind you).
++            Faction pool[3] = { Faction::Axis, Faction::Militia, Faction::Rebels };
++            Faction aSide = pool[irand(0, 2)];
++            Faction bSide = pool[irand(0, 2)];
++            int guard = 0;
++            while ((!areEnemies(aSide, bSide) || aSide == bSide) && guard++ < 12) {
++                aSide = pool[irand(0, 2)];
++                bSide = pool[irand(0, 2)];
++            }
++
++            // Spawn offset so they don't overlap instantly
++            Vec2 offA{ frand(-60.f, -28.f), frand(-60.f, -28.f) };
++            Vec2 offB{ frand( 28.f,  60.f), frand( 28.f,  60.f) };
++
++            placeSquad(aSide, (int)(center.x + offA.x), (int)(center.y + offA.y), 3 + irand(0, 1));
++            placeSquad(bSide, (int)(center.x + offB.x), (int)(center.y + offB.y), 3 + irand(0, 1));
++
++            // Fake a distant gunfire ping to wake up nearby squads
++            sounds.push_back({
++                center,
++                cfg::GunshotHearTiles * cfg::TileSize * 0.85f,
++                cfg::HearDecayS * 0.9f
++            });
++
++            if (barksEnabled) {
++                barks.push_back({ center, "Distant gunfire...", 2.2f });
++            }
++
++            // Cooldown so it doesn't cascade
++            mission.ambientSkirmishCooldownS = frand(22.0f, 40.0f);
++        }
++    }
++
+     // Simple reinforcement logic: when enemy count dips, spawn new roaming squad
+     if (mission.respawnWavesRemaining > 0) {
+         int living = countLivingEnemies();
+         int threshold = std::max(1, mission.totalEnemiesAtStart / 3);
+         if (living < threshold) {
