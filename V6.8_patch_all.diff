@@ -1,0 +1,404 @@
+diff --git a/Pathfinders_v6.8.cpp b/Pathfinders_v6.8.cpp
+--- a/Pathfinders_v6.8.cpp
++++ b/Pathfinders_v6.8.cpp
+@@ -1,3 +1,4 @@
++// V6.8 unified file patch: barks + ambient skirmish + rebel intel + calm patrol + suppression->flank
+ // (rest of file...)
+
+@@ -490,6 +491,10 @@
+ struct MissionState {
+     // Respawn waves for enemies
+     int respawnWavesRemaining = 0;
++
++    // Ambient skirmishes (enemy-vs-enemy fights spawned away from player)
++    float ambientSkirmishCooldownS = 0.0f; // time until next ambient skirmish is allowed
++    float ambientSkirmishTimerS    = 0.0f; // internal timer for periodic checks
+
+     // Stats
+     int shotsFired = 0;
+@@ -2488,6 +2493,204 @@
+ bool Game::areEnemies(Faction a, Faction b) const {
+     if (sameSide(a, b)) return false;
+     return true;
+ }
+
++// -----------------------------------------------------------
++// Bark helpers (faction flavour + direction callouts)
++// -----------------------------------------------------------
++
++static std::string compass8(const Vec2& from, const Vec2& to) {
++    Vec2 d = to - from;
++    if (lenSq(d) < 1.0f) return "here";
++    float a = std::atan2(d.y, d.x); // -pi..pi
++    // Map: E, SE, S, SW, W, NW, N, NE (y grows down)
++    const char* dirs[8] = { "east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east" };
++    float t = (a + 3.14159265f) / (2.0f * 3.14159265f); // 0..1
++    int idx = (int)std::floor(t * 8.0f + 0.5f) & 7;
++    return dirs[idx];
++}
++
++// Faction-specific "what do we call them?" strings
++static const char* factionLabelFor(Faction speaker, Faction target) {
++    if (speaker == Faction::Rebels) {
++        switch (target) {
++        case Faction::Axis:    return "fascists";
++        case Faction::Militia: return "rats";
++        case Faction::Allies:  return "rookies";
++        default:               return "them";
++        }
++    }
++    if (speaker == Faction::Militia) {
++        switch (target) {
++        case Faction::Axis:    return "comrades";
++        case Faction::Allies:  return "dogs";
++        case Faction::Rebels:  return "scum";
++        default:               return "them";
++        }
++    }
++    if (speaker == Faction::Axis) {
++        switch (target) {
++        case Faction::Militia: return "boys";
++        case Faction::Rebels:  return "scum";
++        case Faction::Allies:  return "foreign dogs";
++        default:               return "them";
++        }
++    }
++    // Allies
++    switch (target) {
++    case Faction::Axis:    return "fascists";
++    case Faction::Militia: return "trash";
++    case Faction::Rebels:  return "resistance";
++    default:               return "them";
++    }
++}
++
++static std::string barkSpottedEnemy(Faction speaker, Faction target, const std::string& dirWord) {
++    const char* label = factionLabelFor(speaker, target);
++    // Keep short; barks stack on-screen.
++    if (speaker == Faction::Axis) {
++        if (target == Faction::Militia) return std::string("Militia ") + label + "! Look alive!";
++        return std::string(label) + " to the " + dirWord + "!";
++    }
++    if (speaker == Faction::Militia) {
++        if (target == Faction::Axis) return std::string(label) + "! " + dirWord + "!";
++        return std::string(label) + " to the " + dirWord + "!";
++    }
++    return std::string(label) + " to the " + dirWord + "!";
++}
++
++static const char* planBark(Faction side, SquadIntent intent) {
++    switch (side) {
++    case Faction::Axis:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold. Watch your sector.";
++        case SquadIntent::Advance: return "Advance. Keep pressure.";
++        case SquadIntent::Flank:   return "Flank them. Move!";
++        case SquadIntent::Retreat: return "Fall back. Re-form!";
++        case SquadIntent::Search:  return "Sweep. Find them.";
++        }
++        break;
++    case Faction::Allies:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold. Cover that lane.";
++        case SquadIntent::Advance: return "Move up. Stay sharp.";
++        case SquadIntent::Flank:   return "Flank. Go!";
++        case SquadIntent::Retreat: return "Back! Find cover!";
++        case SquadIntent::Search:  return "Sweep it. Eyes open.";
++        }
++        break;
++    case Faction::Rebels:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Hold here. Stay low.";
++        case SquadIntent::Advance: return "Push! Push!";
++        case SquadIntent::Flank:   return "Around the side! Move!";
++        case SquadIntent::Retreat: return "Back! Back!";
++        case SquadIntent::Search:  return "They're close. Check corners!";
++        }
++        break;
++    case Faction::Militia:
++        switch (intent) {
++        case SquadIntent::Hold:    return "Stay put. Don't die.";
++        case SquadIntent::Advance: return "Go on... go on!";
++        case SquadIntent::Flank:   return "Try the side...!";
++        case SquadIntent::Retreat: return "Run! Find cover!";
++        case SquadIntent::Search:  return "Look around... carefully.";
++        }
++        break;
++    }
++    return "Move!";
++}
++
++// Reposition helper: when suppressed, step to nearest cover relative to a threat.
++// Uses your existing findNearestCoverToward().
++Vec2 Game::findRepositionFromSuppression(const Vec2& selfPos, const Vec2& threatPos) const {
++    // Move "sideways" a bit, then snap to cover toward threat.
++    Vec2 to = threatPos - selfPos;
++    if (lenSq(to) < 1.0f) return selfPos;
++    Vec2 dir = normalize(to);
++    Vec2 right{ -dir.y, dir.x };
++    float side = (frand(0.f, 1.f) < 0.5f) ? -1.0f : 1.0f;
++    Vec2 cand = selfPos + right * side * frand(60.f, 120.f);
++    return findNearestCoverToward(cand, threatPos);
++}
++
+@@ -2705,14 +2914,16 @@
+         actors.push_back(a);
+         s.members.push_back((int)actors.size() - 1);
+-
+-        s.initialCount = (int)s.members.size();
+-        s.suppression = 0.0f;
+-        s.confidence = 1.0f;
+-
+     }
++
++    // Squad bookkeeping (do once, after members added)
++    s.initialCount = (int)s.members.size();
++    s.suppression = 0.0f;
++    s.confidence = 1.0f;
+
+@@ -3030,26 +3241,8 @@
+         if (s.leader >= 0 && s.leader < (int)actors.size() && actors[s.leader].alive()) {
+             barkPos = actors[s.leader].pos;
+         }
+-
+-        switch (s.intent) {
+-        case SquadIntent::Hold:
+-            pushBark(barkPos, "Hold position. Watch that sector.", 2.0f);
+-            break;
+-        case SquadIntent::Advance:
+-            pushBark(barkPos, "Advance on that position.", 2.0f);
+-            break;
+-        case SquadIntent::Flank:
+-            pushBark(barkPos, "Flank them. Move!", 2.0f);
+-            break;
+-        case SquadIntent::Retreat:
+-            pushBark(barkPos, "Fall back! Find cover!", 2.0f);
+-            break;
+-        case SquadIntent::Search:
+-            pushBark(barkPos, "They were just here. Sweep that area.", 2.0f);
+-            break;
+-        }
++        pushBark(barkPos, planBark(s.side, s.intent), 2.0f);
+     }
+
+@@ -3060,6 +3253,32 @@
+     // --- Decide if we should re-plan a new intent ---
+     bool canReplan = (s.intentTimer <= 0.0f);
+
++    // Suppression influences intent: more suppression = less flank/advance, more hold/retreat/search
++    float suppressNorm = std::clamp(s.suppression / 40.0f, 0.0f, 1.0f);
++
+     if (contactNow && canReplan) {
+         // Simple scoring for intents
+         float distToEnemy = length(enemyPos - center);
+@@ -3084,6 +3303,18 @@
+         float scoreRetreat = 0.10f;
+         float scoreSearch = 0.05f;
+
++        // Suppression shifts choices (this is separate from confidence)
++        // - high suppression: don't flank/advance; prefer hold/search/retreat
++        scoreAdvance *= (1.0f - 0.55f * suppressNorm);
++        scoreFlank   *= (1.0f - 0.70f * suppressNorm);
++        scoreHold    *= (1.0f + 0.45f * suppressNorm);
++        scoreSearch  *= (1.0f + 0.35f * suppressNorm);
++        scoreRetreat *= (1.0f + 0.55f * suppressNorm);
++
+         // Confidence impact on scoring (local copy)
+         float confLocal = std::clamp(s.confidence, 0.0f, 1.0f); // 0 = broken, 1 = fearless
+@@ -3160,6 +3391,20 @@
+         consider(SquadIntent::Retreat, scoreRetreat);
+         consider(SquadIntent::Search, scoreSearch);
+
++        // Chance: Search -> Flank when confidence is decent and suppression is low (keeps player moving)
++        if (bestIntent == SquadIntent::Search) {
++            float pFlank = 0.10f;
++            pFlank += (confLocal - 0.5f) * 0.20f;          // more confident -> more flank
++            pFlank += anyVisual ? 0.10f : 0.00f;           // if eyes-on, more likely
++            pFlank -= suppressNorm * 0.25f;                // suppressed -> less flank
++            pFlank = std::clamp(pFlank, 0.0f, 0.35f);
++            if (frand(0.f, 1.f) < pFlank) bestIntent = SquadIntent::Flank;
++        }
++
+         s.intent = bestIntent;
+         s.intentExecuting = false;
+         s.intentTimer = frand(4.0f, 7.0f);   // commit to this plan
+@@ -3291,6 +3536,18 @@
+     bool seesThreat  = false;
+     bool hasThreat   = acquireThreat(a, threatPos, threatIdx, seesThreat);
+
++    // Flavour bark when visually spotting an enemy (faction-to-faction callouts)
++    if (hasThreat && seesThreat && barksEnabled && a.barkCooldown <= 0.f) {
++        Faction tgt = (threatIdx == -1) ? player.team : actors[threatIdx].team;
++        if (frand(0.f, 1.f) < 0.20f) { // keep occasional
++            std::string dirWord = compass8(a.pos, threatPos);
++            std::string line = barkSpottedEnemy(a.team, tgt, dirWord);
++            pushBark(a.pos, line.c_str(), 1.9f);
++            a.barkCooldown = 2.6f;
++        }
++    }
++
+@@ -3367,6 +3624,70 @@
+             }
+         }
+     }
+
++    // Rebel intel chatter: if player is friendly + in Rebel FOV and rebels aren't engaged, call out danger.
++    if (a.team == Faction::Rebels &&
++        playerPresent && player.alive() &&
++        sameSide(a.team, player.team) &&
++        !hasThreat)
++    {
++        bool los = false;
++        if (sees(a, player.pos, los) && los) {
++            Vec2 bestEnemyPos{};
++            bool haveEnemy = false;
++            float bestD2 = 1e30f;
++
++            // Prefer squad last known enemy
++            if (a.squadId >= 0 && a.squadId < (int)squads.size()) {
++                const Squad& sq = squads[a.squadId];
++                if (sq.hasLastKnownEnemy) {
++                    bestEnemyPos = sq.lastKnownEnemy;
++                    haveEnemy = true;
++                }
++            }
++
++            // Else scan: nearest enemy to player
++            if (!haveEnemy) {
++                for (const auto& o : actors) {
++                    if (!o.alive()) continue;
++                    if (!areEnemies(player.team, o.team)) continue;
++                    float d2 = lenSq(o.pos - player.pos);
++                    if (d2 < bestD2) { bestD2 = d2; bestEnemyPos = o.pos; haveEnemy = true; }
++                }
++            }
++
++            if (barksEnabled && a.barkCooldown <= 0.f) {
++                if (haveEnemy) {
++                    std::string dirWord = compass8(player.pos, bestEnemyPos);
++                    std::string line = std::string("Psst. Trouble to the ") + dirWord + ".";
++                    pushBark(a.pos, line.c_str(), 2.3f);
++                    a.barkCooldown = 6.0f;
++                } else if (frand(0.f, 1.f) < 0.06f) {
++                    pushBark(a.pos, "Quiet day... for now.", 2.0f);
++                    a.barkCooldown = 6.0f;
++                }
++            }
++        }
++    }
++
+@@ -3399,6 +3720,32 @@
+         }
+         else {
+-            if (a.recentlyHit) {
++            if (a.recentlyHit) {
+                 a.state = AIState::Hunker;
+             }
+             else if (a.hasOrder) {
+                 a.state = AIState::Seek;
+             }
+             else {
+-                if (a.state != AIState::Patrol && a.state != AIState::Idle)
+-                    a.state = AIState::Patrol;
++                // ✅ Calm patrol fix: never sit in Idle indefinitely.
++                // If no threats and no orders, always Patrol (Patrol includes FOV swivel + occasional wander).
++                a.state = AIState::Patrol;
+             }
+         }
+     }
+@@ -3515,6 +3862,30 @@
+     case AIState::Idle:
+-        desiredVel = Vec2{ 0,0 };
++        // Safety net: if someone is in Idle, add a tiny periodic facing swivel so they look alive
++        desiredVel = Vec2{ 0,0 };
++        if (frand(0.f, 1.f) < 0.35f * dt) {
++            float yaw = std::atan2(a.facing.y, a.facing.x);
++            yaw += frand(-0.6f, 0.6f);
++            a.facing = normalize(Vec2(std::cos(yaw), std::sin(yaw)));
++        }
+         break;
+
+@@ -3605,6 +3976,46 @@
+     case AIState::Attack: {
+         if (hasThreat && seesThreat) {
+             Vec2 to = threatPos - a.pos;
+             if (length(to) > 1.f) a.facing = normalize(to);
+             desiredVel = Vec2{ 0,0 };
++
++            // Reposition when suppressed: step sideways into cover occasionally.
++            if (a.squadId >= 0 && a.squadId < (int)squads.size()) {
++                const Squad& sq = squads[a.squadId];
++                float suppressNormA = std::clamp(sq.suppression / 40.0f, 0.0f, 1.0f);
++                if (suppressNormA > 0.35f && frand(0.f, 1.f) < (0.10f + 0.25f * suppressNormA) * dt) {
++                    Vec2 rep = findRepositionFromSuppression(a.pos, threatPos);
++                    if (length(rep - a.pos) > 18.f) {
++                        if (a.path.empty() || a.repathTimer <= 0.f) {
++                            buildPath(a.pos, rep, a);
++                            a.repathTimer = 0.8f;
++                        }
++                        a.state = AIState::Seek;
++                        a.hasOrder = true;
++                        a.orderPos = rep;
++                        break;
++                    }
++                }
++            }
+ 
+             if (a.gun.canFire()) {
+                 Bullet b;
+                 b.pos = a.pos;
+                 b.dir = normalize(to);
+@@ -4295,6 +4706,86 @@
+ void Game::updateMission(float dt) {
+     if (!mission.active) return;
++
++    // -------------------------------------------------------
++    // Ambient skirmishes: spawn small enemy-vs-enemy fights in clear areas
++    // -------------------------------------------------------
++    mission.ambientSkirmishCooldownS = std::max(0.0f, mission.ambientSkirmishCooldownS - dt);
++    mission.ambientSkirmishTimerS += dt;
++
++    // Try a skirmish every ~10 seconds when mission isn't too hot
++    if (mission.ambientSkirmishCooldownS <= 0.0f && mission.ambientSkirmishTimerS > 10.0f) {
++        mission.ambientSkirmishTimerS = 0.0f;
++
++        float p = 0.22f - 0.03f * (float)mission.alarmLevel;
++        if (mission.phase == MissionPhase::Exfil) p *= 0.6f;
++        p = std::max(0.0f, p);
++
++        if (frand(0.0f, 1.0f) < p) {
++            std::vector<Vec2> avoid{ player.pos };
++            Vec2 center = randomClearPos(8, avoid, 22.0f);
++
++            // Choose two hostile factions (avoid Allies for “ambient” fights)
++            Faction pool[3] = { Faction::Axis, Faction::Militia, Faction::Rebels };
++            Faction aSide = pool[irand(0, 2)];
++            Faction bSide = pool[irand(0, 2)];
++            int guard = 0;
++            while ((!areEnemies(aSide, bSide) || aSide == bSide) && guard++ < 12) {
++                aSide = pool[irand(0, 2)];
++                bSide = pool[irand(0, 2)];
++            }
++
++            Vec2 offA{ frand(-60.f, -28.f), frand(-60.f, -28.f) };
++            Vec2 offB{ frand( 28.f,  60.f), frand( 28.f,  60.f) };
++
++            placeSquad(aSide, (int)(center.x + offA.x), (int)(center.y + offA.y), 3 + irand(0, 1));
++            placeSquad(bSide, (int)(center.x + offB.x), (int)(center.y + offB.y), 3 + irand(0, 1));
++
++            sounds.push_back({
++                center,
++                cfg::GunshotHearTiles * cfg::TileSize * 0.85f,
++                cfg::HearDecayS * 0.9f
++            });
++
++            if (barksEnabled) {
++                barks.push_back({ center, "Distant gunfire...", 2.2f });
++            }
++
++            mission.ambientSkirmishCooldownS = frand(22.0f, 40.0f);
++        }
++    }
+
+     // ... rest of your mission logic continues unchanged ...
+ }
