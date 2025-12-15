@@ -366,24 +366,8 @@ static inline const char* hitZoneName(HitZone z) {
 static inline Vec2 perpRight(const Vec2& fwd) { return Vec2(-fwd.y, fwd.x); }
 static inline float dot2(const Vec2& a, const Vec2& b) { return a.x * b.x + a.y * b.y; }
 
-static inline HitZone classifyHitZone(const Actor& a, const Vec2& hitPos) {
-    Vec2 fwd = normalize(a.facing);
-    Vec2 right = perpRight(fwd);
-    Vec2 rel = hitPos - a.pos;
+static HitZone classifyHitZone(const struct Actor& a, const Vec2& hitPos);
 
-    // Use actor "length" along facing = a.w, and "width" sideways = a.h
-    float halfF = a.w * 0.5f;
-    float f = dot2(rel, fwd);
-
-    // Split actor length into thirds
-    // front third => Head, middle => Torso, rear => Legs
-    float headCut = halfF * 0.33f;
-    float legsCut = -halfF * 0.20f;
-
-    if (f > headCut) return HitZone::Head;
-    if (f < legsCut) return HitZone::Legs;
-    return HitZone::Torso;
-}
 
 static inline float zoneMultiplier(HitZone z) {
     switch (z) {
@@ -639,7 +623,6 @@ struct Actor {
     // For "hit" reaction
     bool  recentlyHit = false;
     float recentlyHitTimer = 0.0f;
-    Vec2  lastShotOrigin{ 0,0 };
 
     // For search/seek
     Vec2 patrolTarget{ 0,0 };
@@ -657,6 +640,25 @@ struct Actor {
 
     bool alive() const { return hp > 0; }
 };
+
+// --- Hit zone classification (implementation after Actor is defined)
+static HitZone classifyHitZone(const Actor& a, const Vec2& hitPos) {
+    Vec2 fwd = normalize(a.facing);
+    Vec2 rel = hitPos - a.pos;
+
+    // Use actor "length" along facing = a.w
+    float halfF = a.w * 0.5f;
+    float f = dot2(rel, fwd);
+
+    // front third => Head, middle => Torso, rear => Legs
+    float headCut = halfF * 0.33f;
+    float legsCut = -halfF * 0.20f;
+
+    if (f > headCut) return HitZone::Head;
+    if (f < legsCut) return HitZone::Legs;
+    return HitZone::Torso;
+}
+
 
 // -----------------------------------------------------------
 // Weapons (Phase W2 - Loadouts: player + faction tier rules)
@@ -2193,7 +2195,7 @@ void Game::drawActors() {
             std::string lab = "ALLY HP " + std::to_string(player.hp) +
                 "  [" + std::string(weaponName(player.weapon.id)) + "]" +
                 " M" + std::to_string(player.weapon.magAmmo) + "/R" + std::to_string(player.weapon.reserveAmmo);
-                
+
 
             drawText(lab, (int)(pr.x - 10), (int)(pr.y + pr.h + 2), cfg::ColUI);
         }
@@ -2248,7 +2250,6 @@ void Game::drawActors() {
                 std::to_string(e.hp) +
                 " [" + std::string(weaponName(e.weapon.id)) + "]" +
                 " M" + std::to_string(e.weapon.magAmmo) + "/R" + std::to_string(e.weapon.reserveAmmo) +
-                " <" + std::string(hitZoneName(e.lastHitZone)) + ">" +
                 (e.isLeader ? " *" : "") +
                 (e.isHVT ? " [HVT] " : " ") +
                 std::string("[") + stateName(e.state) + "]";
