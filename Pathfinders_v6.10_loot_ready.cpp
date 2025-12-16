@@ -616,7 +616,7 @@ struct Actor {
 
 
     Faction team = Faction::Axis;
-    Gun gun; // legacy (v6.10 firing uses this). We'll bridge to WeaponInstance in Part 3.
+    Gun gun; // legacy (v6.10 firing uses this)
 
     // Phase W1+ : table-driven weapon state (not yet wired into firing until Part 3)
     WeaponInstance weapon;
@@ -725,7 +725,7 @@ static HitZone classifyHitZone(const Actor& a, const Vec2& hitPos) {
 // Weapons (Phase W2 - Loadouts: player + faction tier rules)
 // -----------------------------------------------------------
 
-static float gDamageScale = 0.35f;  // 0.6–0.85 is a good range
+static float gDamageScale = 0.80f;  // 0.6–0.85 is a good range
 
 
 struct FactionWeaponRule {
@@ -734,9 +734,15 @@ struct FactionWeaponRule {
 };
 
 // --- Player start knobs (edit these)
-static WeaponId gPlayerStartWeapon = WeaponId::WELROD;
+static WeaponId gPlayerStartWeapon = WeaponId::THOMPSON;
 static int gPlayerStartMagOverride = -1;     // -1 = use weapon default mag size
 static int gPlayerStartReserveOverride = -1; // -1 = use weapon default reserve
+
+// --- Health tuning knobs (apply to newly spawned units, incl. mission start)
+static int gPlayerHPMax = 60;     // you can tune this
+static int gAlliesAIHPMax = 20;    // if you ever spawn friendly AI squads
+static int gEnemyHPMax = 20;     // tune for “scrappy fights”
+
 
 // --- Faction tier knobs ("soft difficulty")
 static inline FactionWeaponRule weaponRuleForFaction(Faction f) {
@@ -1970,6 +1976,16 @@ Actor Game::makeUnit(Faction f, const Vec2& pos) {
     // AI movement speeds (heavy/plodding)
     a.moveWalkSpeed = cfg::AIWalkSpeed;
     a.moveSprintSpeed = cfg::AISprintSpeed;
+
+    // HP defaults for newly created actors (missions recreate everyone via makeUnit)
+    if (f == Faction::Allies) {
+        a.hpMax = gAlliesAIHPMax;
+    }
+    else {
+        a.hpMax = gEnemyHPMax;
+    }
+    a.hp = a.hpMax;
+
 
     buildDefaultHitRig(a);
     return a;
@@ -4496,9 +4512,14 @@ void Game::startMission(MissionKind kind) {
         }
 
         player = makeUnit(Faction::Allies, spawn);
+
+        // Player gets their own HP knob (missions recreate the player here)
+        player.hpMax = gPlayerHPMax;
         player.hp = player.hpMax;
+
         player.team = Faction::Allies;
         playerPresent = true;
+
 
         // Ensure mission-start player is armed (missions recreate the player here)
         applyPlayerLoadout(player);
