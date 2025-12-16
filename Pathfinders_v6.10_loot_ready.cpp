@@ -37,16 +37,16 @@ namespace cfg {
     // Pawn size (new)
     constexpr float PawnSize = 14.0f;
 
-    constexpr float PlayerWalkSpeed = 60.0f; // was faster //
-    constexpr float PlayerSprintSpeed = 100.0f; // was faster //
-    constexpr float PlayerSneakSpeed = 30.0f; // new: sneak = slow & quiet //
+    constexpr float PlayerWalkSpeed = 50.0f; // was faster //
+    constexpr float PlayerSprintSpeed = 80.0f; // was faster //
+    constexpr float PlayerSneakSpeed = 20.0f; // new: sneak = slow & quiet //
 
     constexpr float BulletSpeed = 520.0f;
     constexpr float BulletMaxRange = 800.0f;
 
     // AI movement
-    constexpr float AIWalkSpeed = 40.0f;
-    constexpr float AISprintSpeed = 80.0f;
+    constexpr float AIWalkSpeed = 30.0f;
+    constexpr float AISprintSpeed = 40.0f;
     
     constexpr float GunshotHearTiles = 18.0f;
     constexpr float FootstepHearWalkTiles = 2.0f;
@@ -623,7 +623,7 @@ struct Actor {
 
 
     AIState state = AIState::Patrol;
-    float  visionRange = 240.0f;
+    float  visionRange = 200.0f;
     float  visionFOVDeg = 90.0f;
 
     float moveWalkSpeed = 70.0f;
@@ -734,7 +734,7 @@ struct FactionWeaponRule {
 };
 
 // --- Player start knobs (edit these)
-static WeaponId gPlayerStartWeapon = WeaponId::THOMPSON;
+static WeaponId gPlayerStartWeapon = WeaponId::GARAND;
 static int gPlayerStartMagOverride = -1;     // -1 = use weapon default mag size
 static int gPlayerStartReserveOverride = -1; // -1 = use weapon default reserve
 
