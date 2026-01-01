@@ -1489,8 +1489,10 @@ private:
     void drawMissionHUD();
     void drawMissionParamsHUD();
     void drawHUD();
+    void drawCrosshair();
     void drawVisionOutlineAndRay(const Actor& a);
     void drawBinocularsPip();
+    void drawBinoFogBoundary();
 
    // void drawSquadDebug();
 
@@ -1535,6 +1537,7 @@ bool Game::initSDL() {
         return false;
     }
 
+
     window = SDL_CreateWindow(
         "Pathfinders v6.8 Sandbox",
         SDL_WINDOWPOS_CENTERED,
@@ -1543,6 +1546,8 @@ bool Game::initSDL() {
         cfg::ScreenH,
         SDL_WINDOW_SHOWN
     );
+
+
     if (!window) {
         std::printf("SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
@@ -1556,6 +1561,8 @@ bool Game::initSDL() {
         std::printf("SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return false;
     }
+
+    SDL_ShowCursor(SDL_DISABLE);
 
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
     return true;
@@ -2725,6 +2732,59 @@ void Game::drawActors() {
    // }
 //}
 
+void Game::drawCrosshair() {
+    if (!playerPresent || !player.alive()) return;
+    if (mapOverlay) return; // optional: let map overlay hide it
+
+    // --- Binoculars cursor override ---
+    if (binoHeld) {
+        // Draw a simple binocular reticle at the mouse position (screen space)
+        int mx = mouseX;
+        int my = mouseY;
+
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 190);
+
+        SDL_RenderDrawLine(renderer, mx - 10, my, mx + 10, my);
+        SDL_RenderDrawLine(renderer, mx, my - 10, mx, my + 10);
+
+        // Optional: small outer box so it feels distinct from ADS
+        SDL_Rect box{ mx - 6, my - 6, 12, 12 };
+        SDL_RenderDrawRect(renderer, &box);
+
+        return; // IMPORTANT: skip weapon spread crosshair
+    }
+
+    // screen-space mouse
+    int mx = mouseX;
+    int my = mouseY;
+
+    // compute aim distance in world
+    Vec2 aim{ (float)worldMouseX, (float)worldMouseY };
+    float d = length(aim - player.pos);
+
+    const WeaponDef& wd = weaponDef(player.weapon.id);
+    float spreadRad = (wd.spreadDeg * 3.14159265f / 180.0f);
+
+    // expected lateral deviation ~ tan(spread) * distance
+    float devWorld = std::tan(spreadRad) * d;
+
+    // convert to screen pixels
+    float devPx = devWorld * zoom;
+
+    // clamp for sanity
+    devPx = std::clamp(devPx, 2.0f, 80.0f);
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 200);
+
+    // simple "spread box" crosshair
+    SDL_RenderDrawLine(renderer, mx - 10, my, mx + 10, my);
+    SDL_RenderDrawLine(renderer, mx, my - 10, mx, my + 10);
+
+    SDL_Rect box{ (int)(mx - devPx), (int)(my - devPx), (int)(devPx * 2), (int)(devPx * 2) };
+    SDL_RenderDrawRect(renderer, &box);
+}
 
 // -----------------------------------------------------------
 // Mission HUD + Mission Params HUD (buttons, toggles)
@@ -5771,17 +5831,17 @@ void Game::handleEvents() {
             }
         } break;
 
-        case SDL_MOUSEWHEEL: {
-            float factor = (e.wheel.y > 0) ? 1.1f : 0.9f;
-
-            zoomNormal *= factor;
-            zoomNormal = std::clamp(zoomNormal, 0.5f, 2.5f);
-
-            // If not aiming/using binos, apply immediately
-            if (!adsHeld && !binoHeld) {
-                zoom = zoomNormal;
-            }
-        } break;
+    //    case SDL_MOUSEWHEEL: {
+    //        float factor = (e.wheel.y > 0) ? 1.1f : 0.9f;
+    //
+    //        zoomNormal *= factor;
+    //        zoomNormal = std::clamp(zoomNormal, 0.5f, 2.5f);
+    //
+    //        // If not aiming/using binos, apply immediately
+    //        if (!adsHeld && !binoHeld) {
+    //            zoom = zoomNormal;
+    //        }
+    //    } break;
 
 
         case SDL_KEYDOWN: {
@@ -6142,11 +6202,20 @@ void Game::update(float dt) {
 
     // Zoom target: ADS zooms main camera a bit; binoculars keep main zoom stable
     float zoomTarget = zoomNormal;
-    if (adsHeld && playerPresent) {
+
+    if (binoHeld) {
+        // Main view expands while using binoculars
+        float zoomWide = 0.85f;              // smaller = more zoomed OUT
+        zoomTarget = std::clamp(zoomWide, 0.55f, zoomNormal);
+    }
+    else if (adsHeld && playerPresent) {
         float zoomMul = 1.18f, pull = 0.22f;
         adsParamsForWeapon(player.weapon.id, zoomMul, pull);
         zoomTarget = std::clamp(zoomNormal * zoomMul, 0.5f, 2.5f);
     }
+
+    zoom += (zoomTarget - zoom) * std::min(1.0f, dt * 10.0f);
+
 
     // Smooth zoom
     zoom += (zoomTarget - zoom) * std::min(1.0f, dt * 10.0f);
@@ -6233,7 +6302,7 @@ void Game::update(float dt) {
 
 
         // 🔫 Player fire with LMB (only in Player mode)
-        if (mouseDownL && mode == Mode::Player && weaponCanFire(player)) {
+        if (mouseDownL && !binoHeld && mode == Mode::Player && weaponCanFire(player)) {
             Vec2 dir0 = normalize(Vec2{ (float)worldMouseX, (float)worldMouseY } - player.pos);
 
             const WeaponDef& wd = weaponDef(player.weapon.id);
@@ -6732,6 +6801,29 @@ void Game::drawBinocularsPip() {
     SDL_RenderDrawLine(renderer, cx - 8, cy, cx + 8, cy);
     SDL_RenderDrawLine(renderer, cx, cy - 8, cx, cy + 8);
 
+    // --- Draw PiP footprint rectangle on main view ---
+    {
+        float pipWorldW = pip.w / pipZoom;
+        float pipWorldH = pip.h / pipZoom;
+
+        float wx0 = focus.x - pipWorldW * 0.5f;
+        float wy0 = focus.y - pipWorldH * 0.5f;
+        float wx1 = wx0 + pipWorldW;
+        float wy1 = wy0 + pipWorldH;
+
+        // project using main cam + zoom
+        float sx0 = (wx0 - camX) * zoom;
+        float sy0 = (wy0 - camY) * zoom;
+        float sx1 = (wx1 - camX) * zoom;
+        float sy1 = (wy1 - camY) * zoom;
+
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 140);
+        SDL_Rect r{ (int)sx0, (int)sy0, (int)(sx1 - sx0), (int)(sy1 - sy0) };
+        SDL_RenderDrawRect(renderer, &r);
+    }
+
+
     // Restore viewport and camera
     SDL_RenderSetViewport(renderer, nullptr);
     SDL_RenderSetScale(renderer, saveZoom, saveZoom);
@@ -6743,6 +6835,55 @@ void Game::drawBinocularsPip() {
     SDL_RenderDrawLineF(renderer,
         player.pos.x - camX, player.pos.y - camY,
         focus.x - camX, focus.y - camY);
+}
+
+void Game::drawBinoFogBoundary() {
+    if (!binoHeld || mapOverlay) return;
+
+    // This boundary represents what the player would normally see (zoomNormal)
+    float visWn = cfg::ScreenW / zoomNormal;
+    float visHn = cfg::ScreenH / zoomNormal;
+
+    // Normal viewport rectangle in WORLD space around current camera center
+    // Camera top-left is camX/camY at current zoom, but we want the "normal zoom" box centered on player.
+    Vec2 center = player.pos;
+    float nx0 = center.x - visWn * 0.5f;
+    float ny0 = center.y - visHn * 0.5f;
+    float nx1 = nx0 + visWn;
+    float ny1 = ny0 + visHn;
+
+    // Convert normal box to SCREEN (using current camX/camY + current zoom)
+    float sx0 = (nx0 - camX) * zoom;
+    float sy0 = (ny0 - camY) * zoom;
+    float sx1 = (nx1 - camX) * zoom;
+    float sy1 = (ny1 - camY) * zoom;
+
+    // Clamp to screen
+    int ix0 = (int)std::floor(std::clamp(sx0, 0.0f, (float)cfg::ScreenW));
+    int iy0 = (int)std::floor(std::clamp(sy0, 0.0f, (float)cfg::ScreenH));
+    int ix1 = (int)std::ceil(std::clamp(sx1, 0.0f, (float)cfg::ScreenW));
+    int iy1 = (int)std::ceil(std::clamp(sy1, 0.0f, (float)cfg::ScreenH));
+
+    // Draw fog outside that rect
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    // green-ish fog into void
+    SDL_SetRenderDrawColor(renderer, 20, 60, 25, 170);
+
+    SDL_Rect top{ 0, 0, cfg::ScreenW, iy0 };
+    SDL_Rect bot{ 0, iy1, cfg::ScreenW, cfg::ScreenH - iy1 };
+    SDL_Rect left{ 0, iy0, ix0, iy1 - iy0 };
+    SDL_Rect right{ ix1, iy0, cfg::ScreenW - ix1, iy1 - iy0 };
+
+    SDL_RenderFillRect(renderer, &top);
+    SDL_RenderFillRect(renderer, &bot);
+    SDL_RenderFillRect(renderer, &left);
+    SDL_RenderFillRect(renderer, &right);
+
+    // Boundary outline
+    SDL_SetRenderDrawColor(renderer, 200, 255, 200, 110);
+    SDL_Rect box{ ix0, iy0, ix1 - ix0, iy1 - iy0 };
+    SDL_RenderDrawRect(renderer, &box);
 }
 
 
@@ -6765,6 +6906,9 @@ void Game::render() {
         drawBinocularsPip();
     }
 
+    if (binoHeld) drawBinoFogBoundary();
+
+    drawCrosshair();
 
  //   if (squadDebugViz) {
    //     drawSquadDebug();
